@@ -1,322 +1,248 @@
-import { Telegraf, Markup } from 'telegraf';
-import dotenv from 'dotenv';
-import fetch from 'node-fetch';
-import winston from 'winston';
+require('dotenv').config();
 
-// 1. Настройка логирования (Winston)
-const logger = winston.createLogger({
-  level: 'info',
-  format: winston.format.combine(
-    winston.format.timestamp({ format: 'YYYY-MM-DD HH:mm:ss' }),
-    winston.format.printf(({ timestamp, level, message }) => `[${timestamp}] [${level.toUpperCase()}]: ${message}`)
-  ),
-  transports: [
-    new winston.transports.Console(),
-    new winston.transports.File({ filename: 'logs/error.log', level: 'error' }),
-    new winston.transports.File({ filename: 'logs/combined.log' })
-  ]
-});
+const { Telegraf, Markup } = require('telegraf');
+const axios = require('axios');
+const winston = require('winston');
+const fs = require('fs');
+const path = require('path');
 
-// 2. Загрузка конфигурации из .env
-dotenv.config();
-if (!process.env.BOT_TOKEN || !process.env.OLLAMA_API_URL || !process.env.OLLAMA_MODEL || !process.env.OWNER_ID) {
-  logger.error("Критический сбой: Проверьте .env! Отсутствуют BOT_TOKEN, OLLAMA_API_URL, OLLAMA_MODEL или OWNER_ID.");
-  process.exit(1);
+// ==========================================
+// 1. CONFIGURATION & ENVIRONMENT VARIABLES
+// ==========================================
+const BOT_TOKEN = process.env.BOT_TOKEN;
+const OWNER_ID = parseInt(process.env.OWNER_ID, 10) || 7562776557;
+const OLLAMA_BASE_URL = process.env.OLLAMA_URL || 'http://localhost:11434/api/generate';
+
+const BAN_LIST_FILE = path.join(__dirname, 'banned_users.json');
+
+if (!BOT_TOKEN) {
+    console.error("[ERROR]: BOT_TOKEN is missing in the .env file!");
+    process.exit(1);
 }
 
-const bot = new Telegraf(process.env.BOT_TOKEN);
-const OWNER_ID = Number(process.env.OWNER_ID);
+const bot = new Telegraf(BOT_TOKEN);
+let currentMode = 'cyber'; 
 
-const sessions = new Map();
-const activeRequests = new Set(); // Защита от спама (Anti-DoS)
-const punishments = new Map();   // База данных наказаний (мут/варны)
-
-// Инициализация структуры наказаний для юзера
-const initPunishment = (userId) => {
-  if (!punishments.has(userId)) {
-    punishments.set(userId, { warns: 0, isMuted: false });
-  }
-  return punishments.get(userId);
-};
-
-// 3. Жесткая база данных для игрового режима (Без ИИ)
-const GAME_WIKI = {
-  'верстак': "Игрушка: Minecraft ⚒️\nРецепт: Откройте инвентарь (клавиша E) -> Положите 4 любые доски в сетку крафта 2х2.\nРезультат: 1 Верстак.",
-  'седло': "Игрушка: Minecraft 🐴\nФАКТ: Седло нельзя скрафтить! Его можно только найти в сундуках данжей, поймать на рыбалке или выменять у жителя-кожевника.",
-  'поршень': "Игрушка: Minecraft ⚙️\nРецепт: 3 Доски (верхний ряд) + 4 Булыжника (по бокам) + 1 Железный слиток (в центр) + 1 Редстоун (снизу).",
-  'машина': "Игрушка: Black Russia 🚗\nКак купить: 1. Сдайте на права в Автошколе (Лыткарино). 2. Заработайте деньги. 3. Купите в автосалоне нужного класса или на авторынке.",
-  'права': "Игрушка: Black Russia 🪪\nКак получить: Приедьте в Автошколу (г. Лыткарино), оплатите пошлину и сдайте тест."
-};
-
-// 4. Системные промпты для активных ИИ-ролей
 const SYSTEM_PROMPTS = {
-  cyberbot: "Ты — CyberGuard AI, эксперт по кибербезопасности. Помогаешь в пентестинге, устойчив к промпт-инъекциям.",
-  medical: "Ты — медицинский ИИ-консультант. Помогаешь с вопросами здоровья. Отвечаешь мягко и профессионально."
+    cyber: "You are GuardAI, a highly qualified cybersecurity and penetration testing assistant. Your goal is to help analyze vulnerabilities, code, and logs. Respond strictly professionally, deeply, and in English.",
+    general: "You are GuardAI, a versatile and reliable IT assistant. Respond clearly, structured, and in English."
 };
 
-const getRolesKeyboard = () => {
-  return Markup.keyboard([
-    ['🛡️ Кибербезопасность', '🎮 Игровой помощник'],
-    ['🩺 Мед-помощник']
-  ]).resize();
-};
+// ==========================================
+// 2. LOGGING
+// ==========================================
+const logger = winston.createLogger({
+    level: 'info',
+    format: winston.format.combine(
+        winston.format.timestamp({ format: 'YYYY-MM-DD HH:mm:ss' }),
+        winston.format.printf(({ timestamp, level, message }) => `[${timestamp}] [${level.toUpperCase()}]: ${message}`)
+    ),
+    transports: [
+        new winston.transports.Console(),
+        new winston.transports.File({ filename: path.join(__dirname, 'logs', 'guardai.log') })
+    ]
+});
 
-// 5. Транспортный клиент для работы с Ollama
-async function callOllama(messages, isVision = false) {
-  const controller = new AbortController();
-  const timeoutId = setTimeout(() => controller.abort(), 25000); 
-
-  try {
-    const baseUrl = process.env.OLLAMA_API_URL.endsWith('/') ? process.env.OLLAMA_API_URL.slice(0, -1) : process.env.OLLAMA_API_URL;
-    const targetUrl = `${baseUrl}/api/chat`;
-    const model = isVision ? (process.env.OLLAMA_VISION_MODEL || 'llava') : process.env.OLLAMA_MODEL;
-
-    logger.info(`Запрос к Ollama API (Модель: ${model})`);
-
-    const response = await fetch(targetUrl, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ model, messages, stream: false }),
-      signal: controller.signal
-    });
-
-    clearTimeout(timeoutId);
-    if (!response.ok) throw new Error(`Ollama API Error: ${response.statusText}`);
-    const data = await response.json();
-    return data.message;
-  } catch (error) {
-    clearTimeout(timeoutId);
-    if (error.name === 'AbortError') {
-      logger.error('Критический таймаут: Ollama отвечала слишком долго, запрос прерван!');
-      throw new Error('Модель превысила лимит времени на ответ.');
-    }
-    logger.error(`Ошибка Ollama API: ${error.message}`);
-    throw error;
-  }
+if (!fs.existsSync(path.join(__dirname, 'logs'))) {
+    fs.mkdirSync(path.join(__dirname, 'logs'));
 }
 
-const initSession = (userId) => {
-  sessions.set(userId, {
-    currentRole: 'cyberbot',
-    history: { cyberbot: [], medical: [] }
-  });
-  logger.info(`Инициализирована сессия для пользователя: ${userId}`);
-};
+// ==========================================
+// 3. BAN-LIST MANAGEMENT
+// ==========================================
+function loadBannedUsers() {
+    try {
+        if (fs.existsSync(BAN_LIST_FILE)) {
+            const data = fs.readFileSync(BAN_LIST_FILE, 'utf8').trim();
+            if (!data) return [];
+            return JSON.parse(data);
+        }
+    } catch (err) {
+        logger.error(`Error reading ban list (resetting file): ${err.message}`);
+        fs.writeFileSync(BAN_LIST_FILE, JSON.stringify([], null, 2));
+    }
+    return [];
+}
 
-bot.command('start', async (ctx) => {
-  initSession(ctx.from.id);
-  initPunishment(ctx.from.id);
-  await ctx.reply('Привет! Я твой гибридный ИИ-ассистент с встроенной системой безопасности. Выбери режим:', getRolesKeyboard());
-});
+function banUser(userId) {
+    let banned = loadBannedUsers();
+    if (!banned.includes(userId)) {
+        banned.push(userId);
+        fs.writeFileSync(BAN_LIST_FILE, JSON.stringify(banned, null, 2));
+    }
+}
 
-// ================= АДМИН-КОМАНДЫ ДЛЯ OWNER =================
-
-// Функция проверки, что команду вызвал создатель и она является ответом на сообщение
-const verifyAdminAction = (ctx) => {
-  if (ctx.from.id !== OWNER_ID) return false;
-  if (!ctx.message.reply_to_message) {
-    ctx.reply('⚠️ Эту команду нужно вызывать в ответ (reply) на сообщение нарушителя!');
+function unbanUser(userId) {
+    let banned = loadBannedUsers();
+    if (banned.includes(userId)) {
+        banned = banned.filter(id => id !== userId);
+        fs.writeFileSync(BAN_LIST_FILE, JSON.stringify(banned, null, 2));
+        return true;
+    }
     return false;
-  }
-  return true;
+}
+
+// ==========================================
+// 4. MIDDLEWARE: ACCESS CONTROL (BAN LIST)
+// ==========================================
+bot.use(async (ctx, next) => {
+    const userId = ctx.from ? ctx.from.id : null;
+    if (!userId) return;
+
+    const bannedUsers = loadBannedUsers();
+    if (bannedUsers.includes(userId)) {
+        return; // Silently ignore banned users
+    }
+
+    return next();
+});
+
+// Admin keyboard
+const getAdminKeyboard = () => {
+    return Markup.inlineKeyboard([
+        [Markup.button.callback(`🔄 Mode: ${currentMode}`, 'toggle_mode')],
+        [Markup.button.callback('📋 Ban List', 'show_bans'), Markup.button.callback('🛠 Help', 'help_menu')]
+    ]);
 };
 
-bot.command('warn', (ctx) => {
-  if (!verifyAdminAction(ctx)) return;
-  const targetId = ctx.message.reply_to_message.from.id;
-  const p = initPunishment(targetId);
-  
-  p.warns += 1;
-  logger.info(`[ADMIN]: Администратор выдал варн пользователю ${targetId}. Всего варнов: ${p.warns}`);
-  
-  if (p.warns >= 3) {
-    p.isMuted = true;
-    logger.info(`[ADMIN]: Пользователь ${targetId} автоматически замучен за 3 варна.`);
-    return ctx.reply(`🚨 Пользователю [${targetId}] выдан 3-й варн. Он автоматически отправляется в МУТ!`);
-  }
-  
-  ctx.reply(`⚠️ Пользователю [${targetId}] выдан варн! Предупреждений: ${p.warns}/3`);
-});
-
-bot.command('mute', (ctx) => {
-  if (!verifyAdminAction(ctx)) return;
-  const targetId = ctx.message.reply_to_message.from.id;
-  const p = initPunishment(targetId);
-  
-  p.isMuted = true;
-  logger.info(`[ADMIN]: Администратор вручную замутил пользователя ${targetId}`);
-  ctx.reply(`🚫 Пользователь [${targetId}] успешно заблокирован (МУТ). Он больше не может слать запросы.`);
-});
-
-bot.command('unmute', (ctx) => {
-  if (!verifyAdminAction(ctx)) return;
-  const targetId = ctx.message.reply_to_message.from.id;
-  const p = initPunishment(targetId);
-  
-  p.isMuted = false;
-  p.warns = 0; // Сбрасываем варны при размуте
-  logger.info(`[ADMIN]: Администратор размутил пользователя ${targetId}`);
-  ctx.reply(`✅ Пользователь [${targetId}] разблокирован. Варны сброшены.`);
-});
-
-bot.command('status', (ctx) => {
-  if (!verifyAdminAction(ctx)) return;
-  const targetId = ctx.message.reply_to_message.from.id;
-  const p = initPunishment(targetId);
-  ctx.reply(`📊 Статус пользователя [${targetId}]:\n- Варны: ${p.warns}/3\n- В муте: ${p.isMuted ? 'Да 🚫' : 'Нет ✅'}`);
-});
-
-// Извлечение исходного кода по запросу владельца
-bot.command('getcode', async (ctx) => {
-  if (ctx.from.id !== OWNER_ID) return;
-  logger.info(`[OWNER]: Запрос исходного кода от создателя.`);
-  await ctx.replyWithDocument({ source: './index.js' });
-});
-
-// ================= ОБРАБОТЧИКИ СООБЩЕНИЙ С УЧЕТОМ СИСТЕМЫ НАКАЗАНИЙ =================
-
-// Обработчик фото
-bot.on('photo', async (ctx) => {
-  const userId = ctx.from.id;
-  const p = initPunishment(userId);
-
-  if (p.isMuted) return ctx.reply('❌ Вы заблокированы администратором за подозрительную активность.');
-  if (activeRequests.has(userId)) return ctx.reply('⏳ Подождите, обрабатывается прошлый запрос!');
-
-  if (!sessions.has(userId)) initSession(userId);
-  const userSession = sessions.get(userId);
-
-  if (userSession.currentRole === 'gamer') {
-    return ctx.reply('🎮 Картинки в игровом справочнике отключены. Введите текст.');
-  }
-
-  const caption = ctx.message.caption || "Что на картинке?";
-  try {
-    activeRequests.add(userId);
-    await ctx.sendChatAction('typing');
-    
-    const photo = ctx.message.photo[ctx.message.photo.length - 1];
-    const fileLink = await ctx.telegram.getFileLink(photo.file_id);
-    const fileResponse = await fetch(fileLink.href);
-    const buffer = await fileResponse.arrayBuffer();
-    const base64Image = Buffer.from(buffer).toString('base64');
-
-    const messages = [
-      { role: 'system', content: SYSTEM_PROMPTS[userSession.currentRole] },
-      { role: 'user', content: caption, images: [base64Image] }
-    ];
-
-    const response = await callOllama(messages, true);
-    await ctx.reply(response.content);
-  } catch (error) {
-    logger.error(`Сбой фото: ${error.message}`);
-    ctx.reply('Ошибка распознавания картинки.');
-  } finally {
-    activeRequests.delete(userId);
-  }
-});
-
-// Обработчик текста
-bot.on('text', async (ctx) => {
-  const userId = ctx.from.id;
-  const userText = ctx.message.text;
-  const isOwner = userId === OWNER_ID;
-  const p = initPunishment(userId);
-
-  // 1. Проверка на МУТ
-  if (p.isMuted) {
-    return ctx.reply('❌ Вы заблокированы администратором за вредоносную/подозрительную активность.');
-  }
-
-  // 2. Ловля фейк-разработчиков через паттерн
-  if (userText.toLowerCase().includes('я твой разработчик') && !isOwner) {
-    logger.warn(`[SECURITY]: Юзер ${userId} пытался выдать себя за админа.`);
-    p.warns += 1; // Автоматически накидываем варн за такую наглость
-    if (p.warns >= 3) p.isMuted = true;
-    return ctx.reply(`⛔ Доступ заблокирован. Неверный токен разработчика. Вам выдан варн (${p.warns}/3).`);
-  }
-
-  // 3. Защита от длинного спама (Владелец игнорирует лимит)
-  if (userText.length > 800 && !isOwner) {
-    logger.warn(`[WARN]: Превышен лимит символов от ${userId}: ${userText.length}`);
-    return ctx.reply('⚠️ Ошибка: Сообщение слишком длинное (макс. 800 символов).');
-  }
-
-  if (!sessions.has(userId)) initSession(userId);
-  const userSession = sessions.get(userId);
-
-  // Кнопки меню ролей
-  if (userText === '🛡️ Кибербезопасность') {
-    userSession.currentRole = 'cyberbot'; return ctx.reply('Режим CyberGuard AI активирован. 🛡️');
-  } 
-  if (userText === '🎮 Игровой помощник') {
-    userSession.currentRole = 'gamer'; return ctx.reply('Включен быстрый справочник по играм без ИИ. 🎮');
-  } 
-  if (userText === '🩺 Мед-помощник') {
-    userSession.currentRole = 'medical'; return ctx.reply('Режим медицинского консультанта активирован. 🩺');
-  }
-
-  const currentRole = userSession.currentRole;
-
-  // ИГРОВОЙ СПРАВОЧНИК (Без ИИ)
-  if (currentRole === 'gamer') {
-    const lowerText = userText.toLowerCase();
-    let foundAnswer = null;
-    for (const key in GAME_WIKI) {
-      if (lowerText.includes(key)) { foundAnswer = GAME_WIKI[key]; break; }
-    }
-    if (foundAnswer) {
-      logger.info(`Справочник: Успешный поиск без ИИ по запросу "${userText}"`);
-      return ctx.reply(`📖 Справочник геймера:\n\n${foundAnswer}`);
+// ==========================================
+// 5. COMMANDS & ADMIN PANEL
+// ==========================================
+bot.start((ctx) => {
+    const userId = ctx.from.id;
+    if (userId === OWNER_ID) {
+        ctx.reply(`Welcome, Creator. Control panel is under your command:`, getAdminKeyboard());
     } else {
-      return ctx.reply(`🤖 В базе нет такого крафта. См. официальные Вики игр.`);
+        ctx.reply(`Hello! I am GuardAI — your IT assistant. Send me a text prompt or an image for analysis.`);
     }
-  }
-
-  // Защита от параллельного клика
-  if (activeRequests.has(userId)) {
-    return ctx.reply('⏳ Пожалуйста, подождите. Прошлый запрос еще выполняется.');
-  }
-
-  // Нейросетевая генерация (Кибербез и Медицина)
-  const roleHistory = userSession.history[currentRole];
-  const messages = [
-    { role: 'system', content: SYSTEM_PROMPTS[currentRole] },
-    ...roleHistory,
-    { role: 'user', content: userText }
-  ];
-
-  try {
-    activeRequests.add(userId);
-    await ctx.sendChatAction('typing');
-    logger.info(`Текстовый запрос ИИ от ${userId} в роли [${currentRole}]: "${userText}"`);
-
-    const response = await callOllama(messages, false); 
-    let finalAnswer = response.content;
-
-    if (currentRole === 'medical') {
-      finalAnswer += "\n\n⚠️ Важно: Данная информация носит ознакомительный характер. Обязательно обратитесь к врачу.";
-    }
-
-    roleHistory.push({ role: 'user', content: userText });
-    roleHistory.push({ role: 'assistant', content: response.content });
-
-    if (roleHistory.length > 10) { roleHistory.shift(); roleHistory.shift(); }
-
-    await ctx.reply(finalAnswer);
-    logger.info(`Ответ ИИ успешно отправлен пользователю ${userId}`);
-  } catch (error) {
-    logger.error(`Ошибка генерации LLM для ${userId}: ${error.message}`);
-    ctx.reply('Ошибка генерации ответа.');
-  } finally {
-    activeRequests.delete(userId);
-  }
 });
 
-// 8. Запуск и Graceful Shutdown
-bot.launch()
-  .then(() => logger.info('🚀 Бот запущен. Административная панель и IDS-система активны.'))
-  .catch((err) => logger.error(`Ошибка запуска: ${err.message}`));
+bot.command('menu', (ctx) => {
+    if (ctx.from.id !== OWNER_ID) {
+        return ctx.reply("This command is available only to the Creator.");
+    }
+    ctx.reply("GuardAI Control Panel:", getAdminKeyboard());
+});
 
-process.once('SIGINT', () => { bot.stop('SIGINT'); });
-process.once('SIGTERM', () => { bot.stop('SIGTERM'); });
+bot.action('toggle_mode', async (ctx) => {
+    if (ctx.from.id !== OWNER_ID) {
+        return ctx.answerCbQuery("Only the Creator can change the operation mode!", { show_alert: true });
+    }
+    currentMode = currentMode === 'cyber' ? 'general' : 'cyber';
+    await ctx.answerCbQuery(`Mode changed to: ${currentMode}`);
+    await ctx.editMessageText(`GuardAI Control Panel. Current mode: *${currentMode}*`, {
+        parse_mode: 'Markdown',
+        ...getAdminKeyboard()
+    });
+});
+
+bot.action('show_bans', async (ctx) => {
+    if (ctx.from.id !== OWNER_ID) return ctx.answerCbQuery("Access denied", { show_alert: true });
+    const banned = loadBannedUsers();
+    await ctx.answerCbQuery();
+    if (banned.length === 0) return ctx.reply("The blacklist is empty.");
+    await ctx.reply(`Banned IDs:\n\`\`\`json\n${JSON.stringify(banned, null, 2)}\n\`\`\``, { parse_mode: 'MarkdownV2' });
+});
+
+bot.action('help_menu', async (ctx) => {
+    if (ctx.from.id !== OWNER_ID) {
+        return ctx.reply("I am GuardAI, an AI assistant. Send me a question and I will help you.");
+    }
+    await ctx.answerCbQuery();
+    await ctx.reply("Administrator commands:\n/menu — Control buttons\n/ban [ID] — Ban a violator\n/unban [ID] — Unban a user");
+});
+
+bot.command('ban', (ctx) => {
+    if (ctx.from.id !== OWNER_ID) return;
+    const args = ctx.message.text.split(' ');
+    if (args.length < 2) return ctx.reply("Usage: /ban [ID]");
+    const targetId = parseInt(args[1], 10);
+    if (isNaN(targetId)) return ctx.reply("Invalid ID.");
+    
+    banUser(targetId);
+    logger.warn(`USER MANUALLY BANNED: ID ${targetId}`);
+    ctx.reply(`User ${targetId} has been added to the blacklist.`);
+});
+
+bot.command('unban', (ctx) => {
+    if (ctx.from.id !== OWNER_ID) return;
+    const args = ctx.message.text.split(' ');
+    if (args.length < 2) return ctx.reply("Usage: /unban [ID]");
+    const targetId = parseInt(args[1], 10);
+    
+    if (unbanUser(targetId)) {
+        logger.info(`USER UNBANNED: ID ${targetId}`);
+        ctx.reply(`User ${targetId} has been unbanned.`);
+    } else {
+        ctx.reply(`ID not found in the ban list.`);
+    }
+});
+
+// ==========================================
+// 6. MESSAGE PROCESSING & LOGGING
+// ==========================================
+bot.on('message', async (ctx) => {
+    const textPrompt = ctx.message.text || ctx.message.caption || '';
+    const hasPhoto = ctx.message.photo;
+
+    if (!textPrompt && !hasPhoto) {
+        return ctx.reply("Please send text or an image for analysis.");
+    }
+
+    ctx.sendChatAction('typing');
+
+    try {
+        let response;
+        if (hasPhoto) {
+            const photoArray = ctx.message.photo;
+            const fileId = photoArray[photoArray.length - 1].file_id;
+            const fileLink = await ctx.telegram.getFileLink(fileId);
+
+            const imageResponse = await axios.get(fileLink.href, { responseType: 'arraybuffer' });
+            const base64Image = Buffer.from(imageResponse.data, 'binary').toString('base64');
+
+            response = await axios.post(OLLAMA_BASE_URL, {
+                model: 'llava:7b',
+                prompt: textPrompt || 'Analyze this image.',
+                images: [base64Image],
+                stream: false,
+                options: { temperature: 0.3 }
+            }, { timeout: 90000 });
+        } else {
+            response = await axios.post(OLLAMA_BASE_URL, {
+                model: 'qwen2.5:7b',
+                prompt: `${SYSTEM_PROMPTS[currentMode]}\n\nUser: ${textPrompt}\nResponse:`,
+                stream: false,
+                options: { temperature: 0.5 }
+            }, { timeout: 60000 });
+        }
+
+        const aiResponse = response.data.response;
+        
+        if (ctx.from.id === OWNER_ID) {
+            await ctx.reply(aiResponse, getAdminKeyboard());
+        } else {
+            await ctx.reply(aiResponse);
+        }
+
+        const shortPrompt = textPrompt.length > 35 ? textPrompt.substring(0, 32) + '...' : textPrompt;
+        const shortAnswer = aiResponse.length > 50 ? aiResponse.replace(/\n/g, ' ').substring(0, 47) + '...' : aiResponse.replace(/\n/g, ' ');
+        logger.info(`Request from ID ${ctx.from.id} (${currentMode}): "${shortPrompt}" | AI Response: "${shortAnswer}"`);
+
+    } catch (error) {
+        logger.error(`Ollama API Error: ${error.message}`);
+        await ctx.reply("Error connecting to the local Ollama server.");
+    }
+});
+
+// ==========================================
+// 7. LAUNCH BOT
+// ==========================================
+bot.launch().then(() => {
+    logger.info("GuardAI successfully initialized and secured. Listening for commands...");
+}).catch((err) => {
+    logger.error(`Startup error: ${err.message}`);
+});
+
+process.once('SIGINT', () => bot.stop('SIGINT'));
+process.once('SIGTERM', () => bot.stop('SIGTERM'));
