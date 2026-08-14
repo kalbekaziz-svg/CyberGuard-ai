@@ -21,7 +21,12 @@ if (!BOT_TOKEN) {
 }
 
 const bot = new Telegraf(BOT_TOKEN);
-let currentMode = 'cyber'; 
+let currentMode = 'cyber';
+
+// Rate limiting: track user requests (userId -> { count, resetTime })
+const userRateLimits = new Map();
+const RATE_LIMIT_WINDOW = 60000; // 1 minute
+const RATE_LIMIT_MAX = 10; // max 10 requests per minute
 
 const SYSTEM_PROMPTS = {
     cyber: "You are GuardAI, a highly qualified cybersecurity and penetration testing assistant. Your goal is to help analyze vulnerabilities, code, and logs. Respond strictly professionally, deeply, and in English.",
@@ -45,6 +50,75 @@ const logger = winston.createLogger({
 
 if (!fs.existsSync(path.join(__dirname, 'logs'))) {
     fs.mkdirSync(path.join(__dirname, 'logs'));
+}
+
+// ==========================================
+// 2.5 UTILITY FUNCTIONS
+// ==========================================
+
+// Split long messages to respect Telegram's 4096 character limit
+function splitMessage(text, maxLength = 4096) {
+    const messages = [];
+    let currentMessage = '';
+    const paragraphs = text.split('\n');
+    
+    for (const paragraph of paragraphs) {
+        if ((currentMessage + paragraph + '\n').length > maxLength) {
+            if (currentMessage) messages.push(currentMessage.trim());
+            currentMessage = paragraph + '\n';
+        } else {
+            currentMessage += paragraph + '\n';
+        }
+    }
+    
+    if (currentMessage) messages.push(currentMessage.trim());
+    return messages;
+}
+
+// Rate limiting check
+function checkRateLimit(userId) {
+    const now = Date.now();
+    const userLimit = userRateLimits.get(userId) || { count: 0, resetTime: now + RATE_LIMIT_WINDOW };
+    
+    if (now > userLimit.resetTime) {
+        userRateLimits.set(userId, { count: 1, resetTime: now + RATE_LIMIT_WINDOW });
+        return { allowed: true, remaining: RATE_LIMIT_MAX - 1 };
+    }
+    
+    if (userLimit.count >= RATE_LIMIT_MAX) {
+        return { allowed: false, remaining: 0, resetTime: userLimit.resetTime };
+    }
+    
+    userLimit.count++;
+    userRateLimits.set(userId, userLimit);
+    return { allowed: true, remaining: RATE_LIMIT_MAX - userLimit.count };
+}
+
+// Validate input sizes
+function validateInput(textPrompt, hasPhoto) {
+    const maxTextLength = 8000;
+    const maxPhotoSize = 20 * 1024 * 1024; // 20MB
+    
+    if (textPrompt && textPrompt.length > maxTextLength) {
+        return { valid: false, error: `Text too long (max ${maxTextLength} chars, got ${textPrompt.length})` };
+    }
+    
+    return { valid: true };
+}
+
+// Health check for Ollama
+async function checkOllamaHealth() {
+    try {
+        await axios.post(OLLAMA_BASE_URL, {
+            model: 'qwen2.5:7b',
+            prompt: 'test',
+            stream: false
+        }, { timeout: 5000 });
+        return true;
+    } catch (error) {
+        logger.warn(`Ollama health check failed: ${error.message}`);
+        return false;
+    }
 }
 
 // ==========================================
@@ -83,7 +157,7 @@ function unbanUser(userId) {
 }
 
 // ==========================================
-// 4. MIDDLEWARE: ACCESS CONTROL (BAN LIST)
+// 4. MIDDLEWARE: ACCESS CONTROL (BAN LIST) & RATE LIMITING
 // ==========================================
 bot.use(async (ctx, next) => {
     const userId = ctx.from ? ctx.from.id : null;
@@ -92,6 +166,15 @@ bot.use(async (ctx, next) => {
     const bannedUsers = loadBannedUsers();
     if (bannedUsers.includes(userId)) {
         return; // Silently ignore banned users
+    }
+    
+    // Rate limiting for non-owners
+    if (userId !== OWNER_ID) {
+        const rateLimit = checkRateLimit(userId);
+        if (!rateLimit.allowed) {
+            const resetDate = new Date(rateLimit.resetTime);
+            return ctx.reply(`⏱️ Rate limit exceeded. Try again after ${resetDate.toLocaleTimeString()}`);
+        }
     }
 
     return next();
@@ -154,27 +237,30 @@ bot.action('help_menu', async (ctx) => {
 
 bot.command('ban', (ctx) => {
     if (ctx.from.id !== OWNER_ID) return;
-    const args = ctx.message.text.split(' ');
+    const args = ctx.message.text.trim().split(/\s+/);
     if (args.length < 2) return ctx.reply("Usage: /ban [ID]");
     const targetId = parseInt(args[1], 10);
-    if (isNaN(targetId)) return ctx.reply("Invalid ID.");
+    if (isNaN(targetId) || targetId <= 0) return ctx.reply("❌ Invalid ID. Must be a positive number.");
+    
+    if (targetId === OWNER_ID) return ctx.reply("❌ Cannot ban the owner.");
     
     banUser(targetId);
     logger.warn(`USER MANUALLY BANNED: ID ${targetId}`);
-    ctx.reply(`User ${targetId} has been added to the blacklist.`);
+    ctx.reply(`✅ User ${targetId} has been added to the blacklist.`);
 });
 
 bot.command('unban', (ctx) => {
     if (ctx.from.id !== OWNER_ID) return;
-    const args = ctx.message.text.split(' ');
+    const args = ctx.message.text.trim().split(/\s+/);
     if (args.length < 2) return ctx.reply("Usage: /unban [ID]");
     const targetId = parseInt(args[1], 10);
+    if (isNaN(targetId) || targetId <= 0) return ctx.reply("❌ Invalid ID. Must be a positive number.");
     
     if (unbanUser(targetId)) {
         logger.info(`USER UNBANNED: ID ${targetId}`);
-        ctx.reply(`User ${targetId} has been unbanned.`);
+        ctx.reply(`✅ User ${targetId} has been unbanned.`);
     } else {
-        ctx.reply(`ID not found in the ban list.`);
+        ctx.reply(`❌ ID not found in the ban list.`);
     }
 });
 
@@ -189,60 +275,118 @@ bot.on('message', async (ctx) => {
         return ctx.reply("Please send text or an image for analysis.");
     }
 
+    // Validate input
+    const validation = validateInput(textPrompt, hasPhoto);
+    if (!validation.valid) {
+        return ctx.reply(`❌ ${validation.error}`);
+    }
+
     ctx.sendChatAction('typing');
 
     try {
         let response;
+        const startTime = Date.now();
+        
         if (hasPhoto) {
             const photoArray = ctx.message.photo;
             const fileId = photoArray[photoArray.length - 1].file_id;
-            const fileLink = await ctx.telegram.getFileLink(fileId);
+            
+            try {
+                const fileLink = await ctx.telegram.getFileLink(fileId);
+                const imageResponse = await axios.get(fileLink.href, { responseType: 'arraybuffer', timeout: 30000 });
+                const base64Image = Buffer.from(imageResponse.data, 'binary').toString('base64');
 
-            const imageResponse = await axios.get(fileLink.href, { responseType: 'arraybuffer' });
-            const base64Image = Buffer.from(imageResponse.data, 'binary').toString('base64');
-
-            response = await axios.post(OLLAMA_BASE_URL, {
-                model: 'llava:7b',
-                prompt: textPrompt || 'Analyze this image.',
-                images: [base64Image],
-                stream: false,
-                options: { temperature: 0.3 }
-            }, { timeout: 90000 });
+                response = await axios.post(OLLAMA_BASE_URL, {
+                    model: 'llava:7b',
+                    prompt: textPrompt || 'Analyze this image.',
+                    images: [base64Image],
+                    stream: false,
+                    options: { temperature: 0.3 }
+                }, { timeout: 120000 });
+            } catch (photoError) {
+                logger.error(`Photo processing error: ${photoError.message}`);
+                return ctx.reply(`❌ Failed to process image: ${photoError.message.includes('timeout') ? 'Request timeout' : 'Invalid image format'}`);
+            }
         } else {
-            response = await axios.post(OLLAMA_BASE_URL, {
-                model: 'qwen2.5:7b',
-                prompt: `${SYSTEM_PROMPTS[currentMode]}\n\nUser: ${textPrompt}\nResponse:`,
-                stream: false,
-                options: { temperature: 0.5 }
-            }, { timeout: 60000 });
+            try {
+                response = await axios.post(OLLAMA_BASE_URL, {
+                    model: 'qwen2.5:7b',
+                    prompt: `${SYSTEM_PROMPTS[currentMode]}\n\nUser: ${textPrompt}\nResponse:`,
+                    stream: false,
+                    options: { temperature: 0.5 }
+                }, { timeout: 90000 });
+            } catch (apiError) {
+                if (apiError.code === 'ECONNREFUSED') {
+                    logger.error(`Ollama not running: ${apiError.message}`);
+                    return ctx.reply(`❌ Ollama server is not running. Please start Ollama and try again.`);
+                } else if (apiError.code === 'ENOTFOUND') {
+                    logger.error(`Ollama host not found: ${apiError.message}`);
+                    return ctx.reply(`❌ Cannot reach Ollama server. Check OLLAMA_URL configuration.`);
+                } else {
+                    throw apiError;
+                }
+            }
         }
 
         const aiResponse = response.data.response;
+        const processingTime = Math.round((Date.now() - startTime) / 1000);
         
-        if (ctx.from.id === OWNER_ID) {
-            await ctx.reply(aiResponse, getAdminKeyboard());
-        } else {
-            await ctx.reply(aiResponse);
+        // Split response if it exceeds Telegram's limit
+        const messageParts = splitMessage(aiResponse);
+        
+        for (let i = 0; i < messageParts.length; i++) {
+            if (ctx.from.id === OWNER_ID && i === messageParts.length - 1) {
+                // Only show admin keyboard on the last message
+                await ctx.reply(messageParts[i], getAdminKeyboard());
+            } else {
+                await ctx.reply(messageParts[i]);
+            }
         }
 
         const shortPrompt = textPrompt.length > 35 ? textPrompt.substring(0, 32) + '...' : textPrompt;
         const shortAnswer = aiResponse.length > 50 ? aiResponse.replace(/\n/g, ' ').substring(0, 47) + '...' : aiResponse.replace(/\n/g, ' ');
-        logger.info(`Request from ID ${ctx.from.id} (${currentMode}): "${shortPrompt}" | AI Response: "${shortAnswer}"`);
+        logger.info(`[${processingTime}s] ${ctx.from.id} (${currentMode}): "${shortPrompt}" → "${shortAnswer}"`);
 
     } catch (error) {
         logger.error(`Ollama API Error: ${error.message}`);
-        await ctx.reply("Error connecting to the local Ollama server.");
+        const errorMsg = error.message.includes('ECONNREFUSED') 
+            ? "❌ Cannot connect to Ollama. Is it running?"
+            : error.message.includes('timeout')
+            ? "⏱️ Request timeout. Ollama is taking too long. Try a simpler prompt."
+            : `❌ Error: ${error.message.substring(0, 100)}`;
+        
+        await ctx.reply(errorMsg);
     }
 });
 
 // ==========================================
 // 7. LAUNCH BOT
 // ==========================================
-bot.launch().then(() => {
-    logger.info("GuardAI successfully initialized and secured. Listening for commands...");
-}).catch((err) => {
-    logger.error(`Startup error: ${err.message}`);
-});
+async function startBot() {
+    logger.info("🚀 Checking Ollama connection...");
+    const ollamaHealthy = await checkOllamaHealth();
+    
+    if (!ollamaHealthy) {
+        logger.warn("⚠️  WARNING: Ollama server is not responding. Bot will continue but may fail on requests.");
+    } else {
+        logger.info("✅ Ollama connection verified.");
+    }
+    
+    bot.launch().then(() => {
+        logger.info("🛡️  GuardAI successfully initialized and secured. Listening for commands...");
+    }).catch((err) => {
+        logger.error(`Startup error: ${err.message}`);
+        process.exit(1);
+    });
+}
 
-process.once('SIGINT', () => bot.stop('SIGINT'));
-process.once('SIGTERM', () => bot.stop('SIGTERM'));
+startBot();
+
+process.once('SIGINT', () => {
+    logger.info("Shutting down gracefully...");
+    bot.stop('SIGINT');
+});
+process.once('SIGTERM', () => {
+    logger.info("Shutting down gracefully...");
+    bot.stop('SIGTERM');
+});
