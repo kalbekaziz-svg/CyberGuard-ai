@@ -58,7 +58,15 @@ An advanced, local-first Telegram bot designed for cybersecurity analysis, penet
 
 ## ✨ What's New
 
-### Latest Improvements (v1.1.0)
+### Latest Improvements (v1.2.0)
+- 🎛️ **Enhanced Admin Panel** - 6 button control panel with stats, users, and settings
+- 📊 **Statistics Dashboard** - Real-time metrics (requests, users, uptime, avg response time)
+- 👥 **User Activity Tracking** - See all active users with request counts and last activity
+- ⚙️ **Dynamic Settings** - Change rate limits without restarting bot (/limit command)
+- 🔄 **Advanced User Management** - View, ban, unban users with activity info
+- 📋 **User Request History** - Track individual user stats in activity panel
+
+### Previous Improvements (v1.1.0)
 - ✅ **Rate Limiting**: Prevent bot spam with configurable per-user limits
 - ✅ **Message Chunking**: Long AI responses automatically split into multiple messages
 - ✅ **Ollama Health Check**: Verifies Ollama is running before processing requests
@@ -191,19 +199,100 @@ node index.js
 | `/start` | Initialize the bot and get welcome message |
 | Send text/image | Analyze with current AI model |
 
-### Owner Commands
+### Owner/Admin Commands
 | Command | Description |
 |---------|-------------|
-| `/menu` | Show admin control panel |
+| `/menu` | Show admin control panel with all buttons |
+| `/stats` | View detailed statistics & uptime |
 | `/ban [ID]` | Ban a user by their numeric ID |
 | `/unban [ID]` | Remove a user from ban list |
+| `/limit [N]` | Set rate limit to N requests/minute |
 
-### Admin Panel (via `/menu`)
-- **🔄 Mode: [current]** - Toggle between Cyber/General modes
-- **📋 Ban List** - View all banned user IDs
-- **🛠 Help** - Show admin commands reference
+### 🎛️ Advanced Admin Panel (via `/menu`)
 
-### Example Interactions
+The admin panel now features a comprehensive control interface:
+
+**Panel Buttons:**
+| Button | Function |
+|--------|----------|
+| **🔄 Mode: [cyber/general]** | Toggle between Cyber & General modes |
+| **📊 Stats** | View real-time statistics (requests, users, uptime, avg response time) |
+| **👥 Users** | See all active users with request counts & last activity |
+| **📋 Bans** | View complete ban list with user IDs |
+| **⚙️ Settings** | Access rate limit & temperature adjustments |
+| **🛠 Help** | Display admin command reference |
+
+**Settings Sub-Menu:**
+- **📈 Rate Limit** - Adjust requests/minute dynamically (use `/limit [N]`)
+- **🌡️ Temperature** - Control AI creativity (0.0=focused, 1.0=creative)
+- **🔙 Back** - Return to main admin panel
+
+**Statistics Display:**
+```
+📊 STATISTICS
+✅ Total Requests: [count]
+👥 Total Users: [count]
+⏱️ Avg Response: [Xs]
+📈 Current Mode: [cyber/general]
+🕐 Uptime: [Xh Ym]
+⚙️ Rate Limit: [N]/min
+```
+
+---
+
+### 📊 Monitoring & Analytics
+
+**Real-Time Metrics Available:**
+- **Total Requests Processed** - Cumulative count since bot started
+- **Total Unique Users** - Number of distinct users interacted
+- **Average Response Time** - Mean processing time per request
+- **Current Operation Mode** - Cyber or General
+- **Uptime** - How long bot has been running
+- **Rate Limit Settings** - Current requests/minute threshold
+
+**Example Usage:**
+```
+Owner: /stats
+Bot: 📊 STATISTICS
+     ✅ Total Requests: 156
+     👥 Total Users: 23
+     ⏱️ Avg Response: 4s
+     📈 Current Mode: cyber
+     🕐 Uptime: 5h 32m
+     ⚙️ Rate Limit: 10/min
+```
+
+### 👥 User Management Examples
+
+**View Active Users:**
+```
+Owner: /menu → [Click 👥 Users button]
+Bot: Shows list with user IDs, request counts, and last activity
+     1. ✅ ID: 123456789 | Requests: 45 | Last: 2026-08-14 14:32:15
+     2. 🚫 ID: 987654321 | Requests: 2 | Last: 2026-08-14 10:15:30
+```
+
+**Ban/Unban Users:**
+```
+Owner: /ban 987654321
+Bot: ✅ User 987654321 has been added to the blacklist.
+     📊 Total banned: 3
+
+Owner: /unban 987654321
+Bot: ✅ User 987654321 has been unbanned.
+     📊 Total banned: 2
+```
+
+**Adjust Rate Limiting:**
+```
+Owner: /limit 20
+Bot: ✅ Rate limit updated to 20 requests/minute.
+
+Owner: /limit 5
+Bot: ✅ Rate limit updated to 5 requests/minute.
+```
+
+### Example User Interactions
 
 **Analyzing Security Code:**
 ```
@@ -221,8 +310,8 @@ Bot: [Visual analysis and recommendations]
 **Mode Switching (Owner):**
 ```
 Owner: /menu
-Bot: [Shows control panel]
-Owner: [Click 🔄 Mode button]
+Bot: [Shows control panel with 6 buttons]
+Owner: [Click 🔄 Mode: cyber button]
 Bot: Mode changed to: general
 ```
 
@@ -230,34 +319,39 @@ Bot: Mode changed to: general
 
 ## 🔧 Configuration
 
-### Adjusting Rate Limits
+### Adjusting Rate Limits Dynamically
 
-Edit `index.js` to customize rate limiting:
+Change rate limits without restarting the bot:
 
-```javascript
-const RATE_LIMIT_WINDOW = 60000;  // 1 minute
-const RATE_LIMIT_MAX = 10;        // 10 requests per user per window
+```bash
+# Set rate limit to 5 requests/minute
+/limit 5
+
+# Set rate limit to 20 requests/minute  
+/limit 20
+
+# Current default: 10 requests/minute per user
 ```
 
-### Changing System Prompts
+### Temperature & Model Parameters
 
-Modify the `SYSTEM_PROMPTS` object in `index.js`:
+Edit the `SYSTEM_PROMPTS` object and model settings in `index.js`:
 
 ```javascript
-const SYSTEM_PROMPTS = {
-    cyber: "Your custom cybersecurity prompt here...",
-    general: "Your custom general assistant prompt here..."
-};
+// Adjust AI creativity for text responses
+options: { temperature: 0.5 }  // 0.0-1.0 scale
+
+// Adjust for image analysis
+options: { temperature: 0.3 }  // Lower = more accurate descriptions
+
+// Available Ollama models
+qwen2.5:7b   // Fast, good for general tasks (default)
+llava:7b     // Vision model for image analysis (default)
 ```
 
-### Ollama Model Selection
+### Static Configuration
 
-Edit the model names in the `/on('message')` handler:
-```javascript
-model: 'qwen2.5:7b',  // Change to other Ollama models
-```
-
-Available models: `ollama list`
+Edit these in `index.js` for permanent changes:
 
 ---
 

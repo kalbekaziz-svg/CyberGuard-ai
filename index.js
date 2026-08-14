@@ -25,8 +25,20 @@ let currentMode = 'cyber';
 
 // Rate limiting: track user requests (userId -> { count, resetTime })
 const userRateLimits = new Map();
-const RATE_LIMIT_WINDOW = 60000; // 1 minute
-const RATE_LIMIT_MAX = 10; // max 10 requests per minute
+let RATE_LIMIT_WINDOW = 60000; // 1 minute
+let RATE_LIMIT_MAX = 10; // max 10 requests per minute
+
+// Statistics tracking
+const stats = {
+    totalRequests: 0,
+    totalUsers: new Set(),
+    startTime: Date.now(),
+    responseTimes: [],
+    lastReset: Date.now()
+};
+
+// Advanced user tracking
+const userActivity = new Map();
 
 const SYSTEM_PROMPTS = {
     cyber: "You are GuardAI, a highly qualified cybersecurity and penetration testing assistant. Your goal is to help analyze vulnerabilities, code, and logs. Respond strictly professionally, deeply, and in English.",
@@ -121,6 +133,29 @@ async function checkOllamaHealth() {
     }
 }
 
+// Track user activity
+function trackUserActivity(userId, action) {
+    stats.totalUsers.add(userId);
+    if (!userActivity.has(userId)) {
+        userActivity.set(userId, { requests: 0, lastRequest: null });
+    }
+    const activity = userActivity.get(userId);
+    activity.requests++;
+    activity.lastRequest = new Date().toLocaleString();
+}
+
+// Get statistics
+function getStats() {
+    const uptime = Math.round((Date.now() - stats.startTime) / 1000);
+    const hours = Math.floor(uptime / 3600);
+    const minutes = Math.floor((uptime % 3600) / 60);
+    const avgResponseTime = stats.responseTimes.length > 0 
+        ? Math.round(stats.responseTimes.reduce((a, b) => a + b, 0) / stats.responseTimes.length)
+        : 0;
+    
+    return `📊 **STATISTICS**\n\n✅ Total Requests: ${stats.totalRequests}\n👥 Total Users: ${stats.totalUsers.size}\n⏱️ Avg Response: ${avgResponseTime}s\n📈 Current Mode: ${currentMode}\n🕐 Uptime: ${hours}h ${minutes}m\n⚙️ Rate Limit: ${RATE_LIMIT_MAX}/min`;
+}
+
 // ==========================================
 // 3. BAN-LIST MANAGEMENT
 // ==========================================
@@ -183,8 +218,18 @@ bot.use(async (ctx, next) => {
 // Admin keyboard
 const getAdminKeyboard = () => {
     return Markup.inlineKeyboard([
-        [Markup.button.callback(`🔄 Mode: ${currentMode}`, 'toggle_mode')],
-        [Markup.button.callback('📋 Ban List', 'show_bans'), Markup.button.callback('🛠 Help', 'help_menu')]
+        [Markup.button.callback(`🔄 Mode: ${currentMode}`, 'toggle_mode'), Markup.button.callback('📊 Stats', 'show_stats')],
+        [Markup.button.callback('👥 Users', 'show_users'), Markup.button.callback('📋 Bans', 'show_bans')],
+        [Markup.button.callback('⚙️ Settings', 'settings_menu'), Markup.button.callback('🛠 Help', 'help_menu')]
+    ]);
+};
+
+// Settings keyboard
+const getSettingsKeyboard = () => {
+    return Markup.inlineKeyboard([
+        [Markup.button.callback(`📈 Rate Limit: ${RATE_LIMIT_MAX}/min`, 'adjust_ratelimit')],
+        [Markup.button.callback('🌡️ Temperature: 0.5', 'adjust_temp')],
+        [Markup.button.callback('🔙 Back', 'back_to_menu')]
     ]);
 };
 
@@ -227,12 +272,68 @@ bot.action('show_bans', async (ctx) => {
     await ctx.reply(`Banned IDs:\n\`\`\`json\n${JSON.stringify(banned, null, 2)}\n\`\`\``, { parse_mode: 'MarkdownV2' });
 });
 
+bot.action('show_stats', async (ctx) => {
+    if (ctx.from.id !== OWNER_ID) return ctx.answerCbQuery("Access denied", { show_alert: true });
+    await ctx.answerCbQuery();
+    await ctx.reply(getStats(), { parse_mode: 'Markdown' });
+});
+
+bot.action('show_users', async (ctx) => {
+    if (ctx.from.id !== OWNER_ID) return ctx.answerCbQuery("Access denied", { show_alert: true });
+    await ctx.answerCbQuery();
+    
+    if (userActivity.size === 0) {
+        return ctx.reply("No user activity recorded yet.");
+    }
+    
+    let userList = '👥 **ACTIVE USERS**\n\n';
+    let i = 1;
+    for (const [userId, data] of userActivity) {
+        const isBanned = loadBannedUsers().includes(userId);
+        const status = isBanned ? '🚫' : '✅';
+        userList += `${i}. ${status} ID: \`${userId}\` | Requests: ${data.requests} | Last: ${data.lastRequest}\n`;
+        i++;
+    }
+    
+    const parts = splitMessage(userList);
+    for (const part of parts) {
+        await ctx.reply(part, { parse_mode: 'Markdown' });
+    }
+});
+
+bot.action('settings_menu', async (ctx) => {
+    if (ctx.from.id !== OWNER_ID) return ctx.answerCbQuery("Access denied", { show_alert: true });
+    await ctx.answerCbQuery();
+    await ctx.reply('⚙️ **SETTINGS PANEL**', {
+        parse_mode: 'Markdown',
+        ...getSettingsKeyboard()
+    });
+});
+
+bot.action('adjust_ratelimit', async (ctx) => {
+    if (ctx.from.id !== OWNER_ID) return ctx.answerCbQuery("Access denied", { show_alert: true });
+    await ctx.answerCbQuery();
+    await ctx.reply('Send: /limit [N] to change rate limit (e.g., /limit 20)');
+});
+
+bot.action('adjust_temp', async (ctx) => {
+    if (ctx.from.id !== OWNER_ID) return ctx.answerCbQuery("Access denied", { show_alert: true });
+    await ctx.answerCbQuery();
+    await ctx.reply('🌡️ Temperature controls creativity (0.0-1.0). Lower = focused, Higher = creative. Current: 0.5');
+});
+
+bot.action('back_to_menu', async (ctx) => {
+    if (ctx.from.id !== OWNER_ID) return ctx.answerCbQuery("Access denied", { show_alert: true });
+    await ctx.answerCbQuery();
+    await ctx.editMessageText('GuardAI Control Panel:', getAdminKeyboard());
+});
+
 bot.action('help_menu', async (ctx) => {
     if (ctx.from.id !== OWNER_ID) {
         return ctx.reply("I am GuardAI, an AI assistant. Send me a question and I will help you.");
     }
     await ctx.answerCbQuery();
-    await ctx.reply("Administrator commands:\n/menu — Control buttons\n/ban [ID] — Ban a violator\n/unban [ID] — Unban a user");
+    await ctx.reply(`🛠️ **ADMINISTRATOR COMMANDS**\n\n/menu — Show control panel\n/stats — View statistics\n/ban [ID] — Ban a user\n/unban [ID] — Unban a user\n/limit [N] — Set rate limit\n\n📌 Click buttons in /menu for quick access.`, { parse_mode: 'Markdown' });
 });
 
 bot.command('ban', (ctx) => {
@@ -246,7 +347,7 @@ bot.command('ban', (ctx) => {
     
     banUser(targetId);
     logger.warn(`USER MANUALLY BANNED: ID ${targetId}`);
-    ctx.reply(`✅ User ${targetId} has been added to the blacklist.`);
+    ctx.reply(`✅ User ${targetId} has been added to the blacklist.\n📊 Total banned: ${loadBannedUsers().length}`);
 });
 
 bot.command('unban', (ctx) => {
@@ -258,10 +359,27 @@ bot.command('unban', (ctx) => {
     
     if (unbanUser(targetId)) {
         logger.info(`USER UNBANNED: ID ${targetId}`);
-        ctx.reply(`✅ User ${targetId} has been unbanned.`);
+        ctx.reply(`✅ User ${targetId} has been unbanned.\n📊 Total banned: ${loadBannedUsers().length}`);
     } else {
         ctx.reply(`❌ ID not found in the ban list.`);
     }
+});
+
+bot.command('stats', (ctx) => {
+    if (ctx.from.id !== OWNER_ID) return ctx.reply("Admin only.");
+    ctx.reply(getStats(), { parse_mode: 'Markdown' });
+});
+
+bot.command('limit', (ctx) => {
+    if (ctx.from.id !== OWNER_ID) return;
+    const args = ctx.message.text.trim().split(/\s+/);
+    if (args.length < 2) return ctx.reply("Usage: /limit [N] (N = requests per minute)");
+    const newLimit = parseInt(args[1], 10);
+    if (isNaN(newLimit) || newLimit <= 0) return ctx.reply("❌ Invalid limit. Must be positive.");
+    
+    RATE_LIMIT_MAX = newLimit;
+    logger.info(`Rate limit changed to ${newLimit}/min`);
+    ctx.reply(`✅ Rate limit updated to ${newLimit} requests/minute.`);
 });
 
 // ==========================================
@@ -330,6 +448,12 @@ bot.on('message', async (ctx) => {
 
         const aiResponse = response.data.response;
         const processingTime = Math.round((Date.now() - startTime) / 1000);
+        
+        // Track statistics
+        stats.totalRequests++;
+        stats.responseTimes.push(processingTime);
+        if (stats.responseTimes.length > 100) stats.responseTimes.shift();
+        trackUserActivity(ctx.from.id, 'message');
         
         // Split response if it exceeds Telegram's limit
         const messageParts = splitMessage(aiResponse);
