@@ -1,3 +1,0 @@
-[2026-07-19 15:07:35] [ERROR]: Критический сбой запуска: 401: Unauthorized
-[2026-07-19 15:14:49] [ERROR]: Ошибка генерации LLM: 400: Bad Request: can't parse entities: Can't find end of the entity starting at byte offset 2972
-[2026-07-19 16:20:10] [ERROR]: Ошибка запуска: 401: Unauthorized
