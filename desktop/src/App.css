@@ -1,0 +1,17 @@
+.auth-container { display: flex; flex-direction: column; align-items: center; justify-content: center; height: 100vh; background: #0a0e27; color: #fff; }
+.auth-box { background: #1a1f3a; padding: 30px; border-radius: 10px; width: 300px; box-shadow: 0 0 20px rgba(0,150,255,0.3); }
+.auth-box input { width: 100%; padding: 12px; margin-bottom: 15px; background: #2a2f4a; border: 1px solid #0096ff; border-radius: 5px; color: #fff; }
+.auth-box button { width: 100%; padding: 12px; background: #0096ff; border: none; border-radius: 5px; color: #fff; font-weight: bold; cursor: pointer; }
+.toggle { background: transparent !important; color: #0096ff; text-decoration: underline; margin-top: 10px; }
+
+.chat-container { display: flex; flex-direction: column; height: 100vh; background: #0a0e27; color: #fff; }
+.header { background: #1a1f3a; padding: 20px; display: flex; justify-content: space-between; align-items: center; }
+.logout { background: #ff4444; border: none; color: #fff; padding: 8px 15px; border-radius: 5px; cursor: pointer; }
+
+.chat-box { display: flex; flex-direction: column; flex: 1; padding: 20px; }
+.messages { flex: 1; overflow-y: auto; margin-bottom: 20px; background: #1a1f3a; border-radius: 10px; padding: 15px; }
+.message.bot { background: #0096ff; padding: 10px; border-radius: 5px; margin-bottom: 10px; }
+
+.input-area { display: flex; gap: 10px; }
+.input-area textarea { flex: 1; padding: 12px; background: #1a1f3a; border: 1px solid #0096ff; border-radius: 5px; color: #fff; resize: none; }
+.input-area button { padding: 12px 30px; background: #0096ff; border: none; border-radius: 5px; color: #fff; font-weight: bold; cursor: pointer; }

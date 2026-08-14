@@ -1,13 +1,29 @@
 {
-  "name": "local-ai-bot",
-  "version": "1.0.0",
-  "type": "commonjs",
-  "main": "index.js",
+  "name": "guardai",
+  "version": "2.0.0",
+  "description": "GuardAI - Local AI with Telegram Bot, Web App, Desktop & Mobile",
+  "private": true,
+  "scripts": {
+    "start": "node index.js",
+    "backend": "node backend/server.js",
+    "backend:dev": "nodemon backend/server.js",
+    "desktop": "cd desktop && npm start",
+    "mobile": "cd mobile && npm start",
+    "install:all": "npm install && cd backend && npm install && cd ../desktop && npm install && cd ../mobile && npm install"
+  },
   "dependencies": {
     "axios": "^1.18.1",
+    "better-sqlite3": "^11.0.0",
+    "cors": "^2.8.5",
     "dotenv": "^17.4.2",
-    "ollama": "^0.5.18",
+    "express": "^4.18.2",
+    "jsonwebtoken": "^9.1.2",
     "telegraf": "^4.16.3",
     "winston": "^3.19.0"
+  },
+  "devDependencies": {
+    "concurrently": "^8.2.2",
+    "nodemon": "^3.0.2"
   }
 }
+
