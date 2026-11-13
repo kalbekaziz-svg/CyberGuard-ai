@@ -1,6 +1,8 @@
 // 1. Load environment variables from the .env file at the very beginning
 require('dotenv').config();
 
+const fs = require('fs');
+const path = require('path');
 const { Telegraf, Markup } = require('telegraf');
 const axios = require('axios');
 const winston = require('winston'); // Winston logger
@@ -30,6 +32,8 @@ const REQUEST_WINDOW_MS = 60_000;
 const REQUESTS_PER_WINDOW = 10;
 const MAX_TEXT_LENGTH = 8_000;
 const MAX_IMAGE_BYTES = 8 * 1024 * 1024;
+const MEMORY_FILE = path.join(__dirname, 'memory.json');
+const MAX_MEMORY_MESSAGES = 12;
 const requestCounts = new Map();
 
 // Check if BOT_TOKEN is present
@@ -74,6 +78,72 @@ let statsData = {
     currentMode: 'cyber'
 };
 
+// Persistent short-term conversation memory, stored separately for every user.
+const userMemories = new Map();
+
+function loadMemories() {
+    if (!fs.existsSync(MEMORY_FILE)) return;
+
+    try {
+        const savedMemories = JSON.parse(fs.readFileSync(MEMORY_FILE, 'utf8'));
+        for (const [userId, messages] of Object.entries(savedMemories)) {
+            if (!Array.isArray(messages)) continue;
+
+            const validMessages = messages
+                .filter(message => (
+                    message &&
+                    (message.role === 'user' || message.role === 'assistant') &&
+                    typeof message.content === 'string'
+                ))
+                .slice(-MAX_MEMORY_MESSAGES);
+
+            if (validMessages.length > 0) userMemories.set(String(userId), validMessages);
+        }
+
+        logger.info(`Loaded conversation memory for ${userMemories.size} users`);
+    } catch (error) {
+        logger.error(`Could not load conversation memory: ${error.message}`);
+    }
+}
+
+function saveMemories() {
+    try {
+        const serializableMemories = Object.fromEntries(userMemories);
+        fs.writeFileSync(MEMORY_FILE, JSON.stringify(serializableMemories, null, 2), 'utf8');
+    } catch (error) {
+        logger.error(`Could not save conversation memory: ${error.message}`);
+    }
+}
+
+function addMemoryMessage(userId, role, content) {
+    const key = String(userId);
+    const messages = userMemories.get(key) || [];
+    messages.push({ role, content: String(content).slice(0, MAX_TEXT_LENGTH) });
+    userMemories.set(key, messages.slice(-MAX_MEMORY_MESSAGES));
+    saveMemories();
+}
+
+function buildMemoryPrompt(userId, currentPrompt) {
+    const history = userMemories.get(String(userId)) || [];
+    const previousMessages = history
+        .map(message => `${message.role === 'user' ? 'User' : 'Assistant'}: ${message.content}`)
+        .join('\n\n');
+
+    return [
+        'Use the conversation history below as context for the current request.',
+        previousMessages,
+        `User: ${currentPrompt}`,
+        'Assistant:'
+    ].filter(Boolean).join('\n\n');
+}
+
+function clearUserMemory(userId) {
+    userMemories.delete(String(userId));
+    saveMemories();
+}
+
+loadMemories();
+
 // --- Helper function to query local Ollama server ---
 async function askOllama(model, prompt, images = []) {
     try {
@@ -116,6 +186,13 @@ bot.command(['start', 'menu'], (ctx) => {
         ['👥 Users', '⚙️ Settings'],
         ['🛠 Help']
     ]).resize());
+});
+
+// Clear the current user's saved conversation history.
+bot.command('clear', (ctx) => {
+    clearUserMemory(ctx.from.id);
+    logger.info(`User ${ctx.from.id} cleared conversation memory`);
+    ctx.reply('Conversation memory cleared.');
 });
 
 // Button: Stats
@@ -205,7 +282,11 @@ bot.on('photo', async (ctx) => {
         });
         const base64Image = Buffer.from(imageResponse.data).toString('base64');
 
-        const aiResponse = await askOllama(OLLAMA_VISION_MODEL, prompt, [base64Image]);
+        const memoryPrompt = buildMemoryPrompt(ctx.from.id, prompt);
+        const aiResponse = await askOllama(OLLAMA_VISION_MODEL, memoryPrompt, [base64Image]);
+
+        addMemoryMessage(ctx.from.id, 'user', prompt);
+        addMemoryMessage(ctx.from.id, 'assistant', aiResponse);
 
         await sendModelResponse(ctx, 'Vision Analysis Result', aiResponse);
         logger.info(`Successfully processed photo for user ${ctx.from.id}`);
@@ -240,7 +321,12 @@ bot.on('text', async (ctx) => {
 
     try {
         await ctx.reply("⏳ Processing with local model (" + OLLAMA_MODEL + ")...");
-        const aiResponse = await askOllama(OLLAMA_MODEL, text);
+        const memoryPrompt = buildMemoryPrompt(ctx.from.id, text);
+        const aiResponse = await askOllama(OLLAMA_MODEL, memoryPrompt);
+
+        addMemoryMessage(ctx.from.id, 'user', text);
+        addMemoryMessage(ctx.from.id, 'assistant', aiResponse);
+
         await sendModelResponse(ctx, 'AI Response', aiResponse);
         logger.info(`Successfully responded to text prompt for user ${ctx.from.id}`);
     } catch (error) {
